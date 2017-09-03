@@ -1,0 +1,5 @@
+# Temporary files
+*~
+
+# Dotfiles local config
+config.json
