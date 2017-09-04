@@ -1,0 +1,529 @@
+#!/bin/env python3
+
+import os, sys, re
+import argparse
+import json
+import subprocess, shlex
+
+class App:
+    _instance = None
+    dry_run = False
+    logFileFD = None
+    log_verbosity = 1
+
+    @classmethod
+    def log(cls, logLevel, line, *args, **kwargs):
+        assert isinstance(logLevel, str)
+        assert isinstance(line, str)
+        if len(args) > 0 or len(kwargs) > 0:
+            line = line.format(*args, **kwargs)
+
+        if not App.logFileFD:
+            App.logFileFD = open("/tmp/dotfiles." + os.environ['USER'] + ".log", "w")
+
+        logFileFD = App.logFileFD
+
+        logFileFD.write("[{}] {}\n".format(logLevel, line))
+
+        if logLevel == LogLevel.INFO:
+            if App.log_verbosity >= 1:
+                print("{}[{}] {}{}".format(Color.Default, logLevel, line, Color.Default))
+        elif logLevel == LogLevel.VERBOSE:
+            if App.log_verbosity >= 2:
+                print("[{}] {}".format(logLevel, line))
+        elif logLevel == LogLevel.ERROR:
+            print("{}[{}] {}{}".format(Color.Red, logLevel, line, Color.Default))
+        elif logLevel == LogLevel.WARNING:
+            print("{}[{}] {}{}".format(Color.Yellow, logLevel, line, Color.Default))
+        elif logLevel == LogLevel.DEBUG:
+            print("{}[{}] {}{}".format(Color.BoldBlack, logLevel, line, Color.Default))
+        elif logLevel == LogLevel.NOTE:
+            print("{}[{}] {}{}".format(Color.BoldBlack, logLevel, line, Color.Default))
+        else:
+            print("[{}] {}".format(logLevel, line))
+
+    @classmethod
+    def sys_execute(cls, cmd, expect_success=True, cwd='/tmp', execute_on_dryrun=False):
+        (stdout, rv) = App._sys_execute(cmd, expect_success=expect_success, cwd=cwd, execute_on_dryrun=execute_on_dryrun)
+        return rv
+
+    @classmethod
+    def _sys_execute(cls, cmd, expect_success=True, cwd='/tmp', execute_on_dryrun=False):
+        assert isinstance(cwd, str)
+        assert os.path.isabs(cwd)
+
+        App.log("VERBOSE", "Exec: cd {}; {}".format(cwd, cmd))
+        if App.dry_run and not execute_on_dryrun:
+            return (0,'')
+
+        p = subprocess.Popen(['bash', '-c', '2>&1 '+cmd], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        stdout,stderr = p.communicate()
+        rv = p.returncode
+        if rv != 0 and expect_success:
+            App.log("ERROR", "stdout:\n" + bytes.decode(stdout, "utf-8"))
+            raise RuntimeError("Command returned exitcode {}:\n{}".format(rv, cmd))
+        else:
+            App.log("VERBOSE", "stdout:\n" + bytes.decode(stdout, "utf-8"))
+
+        return (stdout, rv)
+
+    @classmethod
+    def sys_outputof(cls, cmd, expect_success=True, cwd='/tmp', execute_on_dryrun=False):
+        stdout, rv = App._sys_execute(cmd, expect_success=expect_success, cwd=cwd, execute_on_dryrun=execute_on_dryrun)
+        return bytes.decode(stdout, 'utf-8').strip()
+
+def _debug(line, *args, **kwargs):
+    import traceback
+    if not isinstance(line, str):
+        line = str(line)
+    if len(args) > 0 or len(kwargs) > 0:
+        line = line.format(*args, **kwargs)
+    line += " "*min(120, len(line)) + str.format(" | {0}:{1} {2}", *traceback.extract_stack(limit=2)[0])
+    App.log("DEBUG", line, *args, **kwargs)
+
+
+
+class Dotfiles:
+    remote_dotfiles_url = "git@github.com:rgeary1/dotfiles.git"
+    #remote_dotfiles_url = "/home/richard/.dotfiles_bare"
+    home_dir = None
+    hostname = None
+    dotfiles_dir = None
+    profile_name = None
+    profile_dir = None
+    dotfiles_branch = None
+    overwrite_dotfiles = False
+    ignored_files = set()
+
+    def __init__(self):
+        self.hostname = os.environ.get("HOSTNAME") or os.environ.get("host")
+        self.dotfiles_branch = re.sub(r"[^.]*\.","", self.hostname)
+
+    ###############################################
+    # Dotfiles app
+    #
+
+    def add_dotfile(self, file, expect_exists=True):
+        assert os.path.isdir(self.profile_dir)
+        assert isinstance(file, str)
+
+        # eg. file = ~/foo/.bar
+        src_file = os.path.expanduser(file)
+        src_file = os.path.join(os.path.realpath(os.path.dirname(src_file)), os.path.basename(src_file))
+        assert os.path.isabs(src_file)
+        assert src_file.startswith(self.home_dir), "Can't add dotfiles which aren't under home dir {}".format(self.home_dir)
+
+        if src_file.startswith(self.dotfiles_dir):
+            App.log("VERBOSE", "Can't add .dotfiles to itself. File: {} dotfiles_dir: {}".format(src_file, self.dotfiles_dir))
+            return
+
+        if not expect_exists:
+            if not os.path.exists(src_file):
+                return
+
+        # eg. src_dir = /home/myuser/foo
+        #     rel_dir = foo
+        src_dir = os.path.dirname(src_file)
+        rel_src_file = os.path.relpath(src_file, self.home_dir)
+
+        dest = os.path.normpath(os.path.join(self.profile_dir, rel_src_file))
+
+        # Get relative dir from file to dest file, for symlink
+        # Get relative dir from file to dest file, for symlink
+        if dest.startswith(src_dir):
+            rel_dest = os.path.relpath(dest, src_dir)
+        else:
+            rel_dest = dest
+
+        if os.path.islink(src_file):
+            # Is this already a dotfile symlink?
+            if os.path.realpath(src_file) == dest:
+                App.log("INFO", "Unchanged: {} -> {}".format(src_file, rel_dest))
+                return
+
+            App.log("INFO", "Adding: {} -> {}".format(src_file, rel_dest))
+            FSUtil.copy_file(src_file, dest)
+
+        elif os.path.isfile(src_file):
+            App.log("INFO", "Adding: {} -> {}".format(src_file, rel_dest))
+            FSUtil.move_file_or_dir(src_file, dest, self.overwrite_dotfiles)
+            FSUtil.create_symlink(rel_dest, src_file)
+
+        elif os.path.isdir(src_file):
+            for filename in os.listdir(src_file):
+                f = os.path.join(src_file, filename)
+                self.add_dotfile(f)
+        else:
+            App.log("WARN", "Can't add non-file : " + src_file)
+
+
+    def _install(self, args):
+        dotfiles_dir = args.dotfiles_dir
+
+        if args.profile:
+            self.profile_name = args.profile
+        else:
+            username = os.environ['USER']
+            self.profile_name = input("Enter profile name [{}]? ".format(username)) or username
+
+        App.log("INFO", "Installing Dotfiles to {}".format(dotfiles_dir))
+        App.log("VERBOSE", "Creating dir {}".format(dotfiles_dir))
+
+        if args.remote_url:
+            self.remote_dotfiles_url = args.remote_url
+
+        self.dotfiles_dir = dotfiles_dir
+        if os.path.exists(dotfiles_dir):
+            if os.path.exists(os.path.join(dotfiles_dir, ".git")):
+                existing_remote_url = App.sys_outputof("git remote get-url origin", cwd=self.dotfiles_dir, execute_on_dryrun=True)
+                if existing_remote_url != self.remote_dotfiles_url:
+                    raise ValueError("Unable to clone git repo {} to {}, existing repo points to {}".format(
+                        self.remote_dotfiles_url, dotfiles_dir, existing_remote_url
+                    ))
+            else:
+                raise ValueError("Unable to clone git repo. Non-git dir already exists : "+dotfiles_dir)
+
+        else:
+            App.log("INFO", "Cloning {} to {}".format(self.remote_dotfiles_url, dotfiles_dir))
+            App.sys_execute("git clone {} {}".format(self.remote_dotfiles_url, dotfiles_dir))
+
+        App.log("INFO", "Checking out branch {}", self.dotfiles_branch)
+        rv = App.sys_execute("git checkout {}".format(self.dotfiles_branch), cwd=dotfiles_dir, expect_success=False)
+        if rv != 0:
+            App.sys_execute("git checkout -b {} origin/master".format(self.dotfiles_branch), cwd=dotfiles_dir)
+
+        self.home_dir = os.path.realpath(os.environ['HOME'])
+
+        # Write config file
+        config = {
+            "default_profile_name": self.profile_name,
+            "branch": self.dotfiles_branch,
+            "home_dir": self.home_dir,
+        }
+
+        config_file = os.path.join(args.dotfiles_dir, "config.json")
+        with open(config_file, 'w') as f:
+            f.write(json.dumps(config, sort_keys=True, indent=4)+"\n")
+
+        # Create profile dir
+        self.profile_dir = os.path.join(self.dotfiles_dir, self.profile_name)
+
+        if not os.path.exists(self.profile_dir):
+            os.makedirs(self.profile_dir, exist_ok=True)
+
+        self.create_shell_start()
+
+        # Add typical dotfiles
+        reply = input("Add typical dotfiles [Y/n]? ") or 'y'
+        if reply.lower() == 'y':
+            self.add_dotfile("~/.bashrc", expect_exists=False)
+            self.add_dotfile("~/.zshrc", expect_exists=False)
+            self.add_dotfile("~/.profile", expect_exists=False)
+            self.add_dotfile("~/.gdbrc", expect_exists=False)
+            self.add_dotfile("~/.gdbinit", expect_exists=False)
+            self.add_dotfile("~/.vimrc", expect_exists=False)
+            self.add_dotfile("~/.emacs", expect_exists=False)
+            self.add_dotfile("~/.tmux.conf", expect_exists=False)
+            self.add_dotfile("~/.ssh/config", expect_exists=False)
+            self.add_dotfile("~/.inputrc", expect_exists=False)
+            self.add_dotfile("~/.gitconfig", expect_exists=False)
+            self.add_dotfile("~/.gitk", expect_exists=False)
+            self.add_dotfile("~/.npmrc", expect_exists=False)
+
+    def create_shell_start(self):
+        shell_cmd = [ os.readlink("/proc/{}/exe".format(os.getppid())) ]
+        shell_name = os.path.basename(shell_cmd[0])
+        if shell_name == 'bash':
+            shell_cmd.extend(["--rcfile", "$DOTFILE_DIR/.bashrc"])
+        elif shell_name == 'zsh':
+            shell_cmd.extend(["--rcs", "$DOTFILE_DIR/.zshrc"])
+
+        shell_start_file = os.path.join(self.profile_dir, "start-shell")
+        with open(shell_start_file, 'w') as f:
+            f.write('#!/bin/sh\n')
+
+            f.write("export DOTFILE_DIR=${1-$(dirname $0)}\n")
+            f.write("env -i HOME={} LANG={} PATH={} USER={} DOTFILE_DIR=$DOTFILE_DIR \\\n  ".format(
+                os.environ.get("HOME"),
+                os.environ.get("LANG", "en_US.utf8"),
+                "/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin",
+                os.environ.get("USER")
+            ))
+
+            for arg in shell_cmd:
+                f.write('"{}" '.format(arg))
+            f.write("\n")
+        os.chmod(shell_start_file, 0o755)
+
+
+    def sync_removed_files(self, src_dir, dest_dir):
+        assert dest_dir.startswith(self.profile_dir)
+
+        # Find any deleted itemsk
+        for item in os.listdir(dest_dir):
+            dest_path = os.path.join(dest_dir, item)
+            src_path = os.path.join(src_dir, item)
+
+            if not os.path.exists(src_path):
+                if dest_path not in self.ignored_files:
+                    App.log("INFO", "Removing: {}", dest_path)
+                    FSUtil.unlink(dest_path)
+
+            else:
+                # src file exists
+                if os.path.isfile(dest_path) and not os.path.isfile(src_path):
+                    App.log("INFO", "Removing: {}", dest_path)
+                    FSUtil.unlink(dest_path)
+                if os.path.isdir(dest_path):
+                    if os.path.isfile(src_path):
+                        App.log("INFO", "Removing: {}", dest_path)
+                        assert dest_path.startswith(self.profile_dir)
+                        FSUtil.rmrf(dest_path)
+                    else:
+                        self.sync_removed_files(os.path.join(src_dir, item), os.path.join(dest_dir, item))
+
+
+    def cmd_add(self, args):
+        for file in args.files:
+            self.add_dotfile(file)
+
+    def cmd_sync(self):
+        self.sync_removed_files(self.home_dir, self.profile_dir)
+
+        # Commit to git
+        App.sys_execute("git add .", cwd=self.profile_dir)
+        rv = App.sys_execute('git commit -m "Update from {}"'.format(self.hostname), cwd=self.profile_dir, expect_success=False)
+
+        # Merge from origin
+        App.log("INFO", "Rebasing from remote git server")
+        App.sys_execute("git rebase origin {}".format(self.dotfiles_branch), cwd=self.profile_dir)
+
+        if rv == 0:
+            # Commit successful
+            App.log("INFO", "Pushing changes to remote git server")
+            App.sys_execute("git push origin "+self.dotfiles_branch, cwd=self.profile_dir)
+
+    def _apply_args(self, args):
+        if args.log_verbose:
+            App.log_verbosity = 2
+        if args.log_quiet:
+            App.log_verbosity = 0
+        App.dry_run = (args.dry_run != False)
+        FSUtil.dry_run = App.dry_run
+
+        if App.dry_run:
+            App.log("NOTE", "Dry-run enabled")
+
+        assert isinstance(args.cmd, str)
+        assert os.path.isabs(args.dotfiles_dir), "Must be absolute dir "+args.dotfiles_dir
+        assert not os.path.isfile(args.dotfiles_dir), "Must be directory "+args.dotfiles_dir
+        assert not os.path.islink(args.dotfiles_dir), "Must be directory "+args.dotfiles_dir
+
+        if args.cmd == "":
+            args.cmd = "help"
+
+        if args.cmd == "install":
+            self._install(args)
+
+        self.dotfiles_dir = args.dotfiles_dir
+        config_file = os.path.join(args.dotfiles_dir, "config.json")
+        assert os.path.isfile(config_file), "Missing {}. Please run 'dotfiles install' first.".format(args.dotfiles_dir)
+
+        with open(config_file, "r") as f:
+            config = json.loads(f.read())
+
+        self.profile_name = config["default_profile_name"]
+        self.home_dir = config["home_dir"]
+        self.dotfiles_branch = config["branch"]
+
+        assert os.path.isdir(self.home_dir)
+        assert os.path.realpath(self.home_dir) == self.home_dir, "Can't have config.json 'homedir' as a symlink, use the real path"
+
+        if hasattr(args, 'profile') and args.profile:
+            self.profile_name = args.profile
+            self.profile_dir = os.path.join(self.dotfiles_dir, self.profile_name)
+
+        assert isinstance(self.profile_name, str)
+        valid_profile_chars = r"[a-zA-Z0-9_\-.]+"
+        if not re.match(valid_profile_chars, self.profile_name):
+            raise ValueError("Invalid profile name {}. Must match {}".format(self.profile_name, str(valid_profile_chars)))
+
+        self.profile_dir = os.path.join(self.dotfiles_dir, self.profile_name)
+        self.ignored_files = set([
+            os.path.join(self.profile_dir, "start-shell")
+        ])
+
+        if os.path.isdir(self.profile_dir):
+            os.makedirs(self.profile_dir, exist_ok=True)
+
+
+    def cmd_shell(self, args):
+        profile_name = args.profile
+        valid_profile_chars = r"[a-zA-Z0-9_\-.]+"
+        if not re.match(valid_profile_chars, profile_name):
+            raise ValueError("Invalid profile name {}. Must match {}".format(self.profile_name, str(valid_profile_chars)))
+
+        profile_dir = os.path.join(self.dotfiles_dir, profile_name)
+
+        if not os.path.isdir(profile_dir):
+            raise ValueError("Could not find profile {}".format(profile_name))
+
+        shell_cmd = os.path.join(self.profile_dir, "start-shell")
+
+        os.execv(shell_cmd, [profile_dir])
+
+    ###############################################
+    # Helper functions
+    #
+
+    def _parse_args(self, argv):
+        dotfiles_dir = os.path.join(os.environ["HOME"], ".dotfiles")
+        ap = argparse.ArgumentParser()
+
+        ap.add_argument("-n", dest="dry_run", action="store_true", help="Don't perform any changes to the home dir")
+        ap.add_argument("--dotfiles-dir", "-d", default=dotfiles_dir, help="The .dotfiles dir name. Default: ~/.dotfiles")
+        ap.add_argument("-v", dest="log_verbose", action="store_true", help="Print verbose logs to stdout")
+        ap.add_argument("-q", dest="log_quiet", action="store_true", help="Quite mode. Prints nothing unless error")
+        ap.set_defaults(cmd="")
+
+        sp = ap.add_subparsers()
+        ap_add = sp.add_parser("add", help="Add a file to dotfiles profile")
+        ap_add.set_defaults(cmd="add")
+        ap_add.add_argument("-f", dest="force", action="store_true", help="Force add. Overwrite files in .dotfiles dir")
+        ap_add.add_argument("files", nargs="+", help="Files to add to dotfiles profile")
+
+        ap_sync = sp.add_parser("sync", help="Sync dotfiles to origin")
+        ap_sync.set_defaults(cmd="sync")
+
+        ap_shell = sp.add_parser("shell", help="Open a shell with a specified profile")
+        ap_shell.set_defaults(cmd="shell")
+        ap_shell.add_argument("profile", help="Profile name")
+
+        ap_install = sp.add_parser("install", help="Install dotfiles")
+        ap_install.set_defaults(cmd="install")
+        ap_install.add_argument("--profile", "-p", help="The dotfiles profile name to uniquely identify this set of dotfiles")
+        ap_install.add_argument("--remote-url", "-u", help="Specify the remote git url. Default : "+self.remote_dotfiles_url)
+        ap_install.add_argument("--branch", "-b", help="Specify the git branch. Default is your hostname domain : "+self.dotfiles_branch)
+
+        args = ap.parse_args(argv)
+
+        # Validate & apply args
+        self._apply_args(args)
+
+        return args
+
+    def main(self, argv):
+        args = self._parse_args(argv[1:])
+        if args.cmd == 'add':
+            self.overwrite_dotfiles = args.force
+            self.cmd_add(args)
+        elif args.cmd == 'sync':
+            self.cmd_sync()
+        elif args.cmd == 'install':
+            self.cmd_sync()
+        elif args.cmd == 'shell':
+            self.cmd_shell(args)
+        else:
+            raise ValueError("Unrecognised command "+args.cmd)
+
+        return 0
+
+#############################
+# Helper classes
+#
+
+class FSUtil:
+    dry_run = True
+
+    @classmethod
+    def move_file_or_dir(cls, src, dest, overwrite=False):
+        assert isinstance(src, str)
+        assert isinstance(dest, str)
+        assert os.path.isabs(src)
+        assert os.path.isabs(dest)
+
+        dest_dir = os.path.dirname(dest)
+        if not os.path.isdir(dest_dir):
+            App.log("VERBOSE", "mkdir -p "+dest_dir)
+            os.makedirs(dest_dir, exist_ok=True)
+
+        App.log("VERBOSE", "mv {} {}", src, dest)
+        if not os.path.exists(src):
+            raise ValueError("Could not find file: "+src)
+        if os.path.exists(dest):
+            if overwrite:
+                FSUtil.unlink(dest)
+            else:
+                raise ValueError("Could not overwrite dest: "+dest)
+
+        if not FSUtil.dry_run:
+            FSUtil.rename(src, dest)
+
+    @classmethod
+    def copy_file(cls,src,dest):
+        assert os.path.exists(src)
+        assert not os.path.exists(src)
+
+        App.log("VERBOSE", "cp {} {}", src, dest)
+        import shutil
+        if not FSUtil.dry_run:
+            shutil.copyfile(src, dest)
+
+    @classmethod
+    def create_symlink(cls,symlink_target, symlink_file):
+        assert isinstance(symlink_target, str)
+        assert isinstance(symlink_file, str)
+
+        if not FSUtil.dry_run:
+            assert not os.path.exists(symlink_file), "Can't make symlink, already exists"
+
+        App.log("VERBOSE", "ln -snf {} {}".format(symlink_target, symlink_file))
+        if not FSUtil.dry_run:
+            os.symlink(symlink_target, symlink_file)
+
+    @classmethod
+    def unlink(cls, file):
+        App.log("VERBOSE", "rm " + file)
+        if not FSUtil.dry_run:
+            os.unlink(file)
+
+    @classmethod
+    def rmrf(cls, dir):
+        App.log("VERBOSE", "rm -rf " + dir)
+        if not FSUtil.dry_run:
+            import shutil
+            shutil.rmtree(dir)
+
+    @classmethod
+    def rename(cls, src, dest):
+        App.log("VERBOSE", "mv {} {}".format(src,dest))
+        if not FSUtil.dry_run:
+            os.rename(src,dest)
+
+class LogLevel:
+    DEBUG = "DEBUG"
+    VERBOSE = "VERBOSE"
+    INFO = "INFO"
+    WARNING = "WARN"
+    ERROR = "ERROR"
+    NOTE = "NOTE"
+
+class Color:
+    Default = "\x1b[m"
+    Red = "\x1b[1;31m"
+    Green = "\x1b[1;32m"
+    Yellow = "\x1b[1;33m"
+    Blue = "\x1b[1;34m"
+    Pink = "\x1b[1;35m"
+    Cyan = "\x1b[1;36m"
+    BoldBlack = "\x1b[1;38m"
+
+if __name__ == "__main__":
+    dotfiles = Dotfiles()
+    try:
+        rv = dotfiles.main(sys.argv)
+        sys.exit(rv)
+    except Exception as ex:
+        App.log("ERROR", str(ex))
+        raise
+

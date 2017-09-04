@@ -1,5 +1,8 @@
 # Temporary files
 *~
 
+# IDE files
+.idea/
+
 # Dotfiles local config
 config.json
